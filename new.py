@@ -34,7 +34,7 @@ except Exception:
 # ─── Configuration ───────────────────────────────────────────
 GATEWAY = "Braintree Auth"
 CREDIT = "@xoxhunterxd"
-BASE = os.environ.get("LM_SITE", os.environ.get("BASE_URL", "https://learnmuscles.com")).rstrip("/")
+BASE = os.environ.get("LM_SITE", os.environ.get("BASE_URL", "")).rstrip("/")
 PM_URL = "/my-account/add-payment-method/"
 GQL_URL = "https://payments.braintree-api.com/graphql"
 IMP = os.environ.get("IMPERSONATE", "chrome120")
