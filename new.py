@@ -34,12 +34,24 @@ except Exception:
 # ─── Configuration ───────────────────────────────────────────
 GATEWAY = "Braintree Auth"
 CREDIT = "@xoxhunterxd"
-BASE = os.environ.get("LM_SITE", os.environ.get("BASE_URL", "")).rstrip("/")
+BASE = os.environ.get("LM_SITE", os.environ.get("BASE_URL", "https://learnmuscles.com")).rstrip("/")
 PM_URL = "/my-account/add-payment-method/"
 GQL_URL = "https://payments.braintree-api.com/graphql"
 IMP = os.environ.get("IMPERSONATE", "chrome120")
-DEFAULT_PROXY = os.environ.get("PROXY", "")
-COOKIE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), os.environ.get("COOKIE_FILE", "lm_cookies.json"))
+def _resolve_cookie_file():
+    target = os.path.join(os.path.dirname(os.path.abspath(__file__)), os.environ.get("COOKIE_FILE", "lm_cookies.json"))
+    if os.environ.get("VERCEL") or not os.access(os.path.dirname(target) or ".", os.W_OK):
+        tmp_target = os.path.join("/tmp", os.path.basename(target))
+        if not os.path.exists(tmp_target) and os.path.exists(target):
+            try:
+                import shutil
+                shutil.copy2(target, tmp_target)
+            except Exception:
+                pass
+        return tmp_target
+    return target
+
+COOKIE_FILE = _resolve_cookie_file()
 UA = os.environ.get(
     "USER_AGENT",
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -167,6 +179,14 @@ def load_pool():
     if os.path.exists(COOKIE_FILE):
         try:
             with open(COOKIE_FILE, "r", encoding="utf-8") as f:
+                d = json.load(f)
+                return d if isinstance(d, list) else []
+        except Exception:
+            return []
+    local_f = os.path.join(os.path.dirname(os.path.abspath(__file__)), os.environ.get("COOKIE_FILE", "lm_cookies.json"))
+    if local_f != COOKIE_FILE and os.path.exists(local_f):
+        try:
+            with open(local_f, "r", encoding="utf-8") as f:
                 d = json.load(f)
                 return d if isinstance(d, list) else []
         except Exception:
