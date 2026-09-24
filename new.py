@@ -262,8 +262,8 @@ def create_account(proxy=None):
     ph = addr_info.get('phone', f"555{random.randint(1000000, 9999999)}")
 
     tag = rnd(6)
-    user = f"lmuser{tag}"
-    mail = f"{user}@examplemail.com"
+    user = f"aloo{tag}"
+    mail = f"{user}@gmail.com"
 
     px = format_proxy(proxy)
     proxies = {"http": px, "https": px} if px else None
@@ -289,7 +289,7 @@ def create_account(proxy=None):
                 "affwp_user_login": user,
                 "affwp_user_email": mail,
                 "affwp_payment_email": mail,
-                "affwp_user_url": "https://example.com",
+                "affwp_user_url": "https://g.com",
                 "affwp_promotion_method": "Fitness blog reviews.",
                 "affwp_honeypot": "",
                 "affwp_redirect": "",
