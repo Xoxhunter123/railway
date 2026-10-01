@@ -159,9 +159,13 @@ def sanitize(msg):
     msg = re.sub(r"\s+", " ", msg)
     return msg.strip()
 
+USE_PROXY = os.environ.get("USE_PROXY", "0").lower() in ("1", "true", "yes")
+
 def format_proxy(proxy_str=None):
-    raw = proxy_str or DEFAULT_PROXY
-    if not raw:
+    if proxy_str and str(proxy_str).lower() in ("none", "direct", "0", "false"):
+        return None
+    raw = proxy_str or (DEFAULT_PROXY if USE_PROXY else None)
+    if not raw and USE_PROXY:
         for pf in ["proxies.txt", "proxy.txt"]:
             pfp = os.path.join(os.path.dirname(os.path.abspath(__file__)), pf)
             if os.path.exists(pfp):
@@ -407,10 +411,10 @@ def create_account(proxy=None):
     Solves Cloudflare Turnstile using CaptchaAI.
     Saves billing address for Braintree vault.
     """
-    px = format_proxy(proxy)
-    proxies = {"http": px, "https": px} if px else None
+    for attempt in range(3):
+        px = format_proxy(proxy)
+        proxies = {"http": px, "https": px} if px else None
 
-    for attempt in range(2):
         fn, ln, user, mail = generate_random_identity()
 
         addr_info = random.choice(US_ADDRESSES)
@@ -425,7 +429,7 @@ def create_account(proxy=None):
 
         try:
             # Step 1: Grab registration nonce from /my-account/
-            h = s.get(BASE + "/my-account/", timeout=30).text
+            h = s.get(BASE + "/my-account/", timeout=15).text
             rn = re.search(r'name="woocommerce-register-nonce"\s+value="([^"]+)"', h)
             if not rn:
                 time.sleep(1.0)
