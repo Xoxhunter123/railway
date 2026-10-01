@@ -48,7 +48,7 @@ except Exception:
 # ─── Configuration ───────────────────────────────────────────
 GATEWAY = "Braintree Auth"
 CREDIT = "@xoxhunterxd"
-BASE = os.environ.get("BOWLERX_SITE", os.environ.get("BASE_URL", "")).rstrip("/")
+BASE = os.environ.get("BOWLERX_SITE", os.environ.get("BASE_URL", "https://www.bowlerx.com")).rstrip("/")
 PM_URL = "/my-account/add-payment-method/"
 GQL_URL = "https://payments.braintree-api.com/graphql"
 IMP = os.environ.get("IMPERSONATE", "chrome120")
@@ -61,15 +61,15 @@ UA = os.environ.get(
 )
 
 # CaptchaAI Turnstile Configuration
-CAPTCHAAI_KEY = os.environ.get("CAPTCHAAI_KEY", "")
+CAPTCHAAI_KEY = os.environ.get("CAPTCHAAI_KEY", "r6skcjc4hvc5hwmrusrcwg8lczqt9med")
 CF_SITEKEY = "0x4AAAAAAAOMqUubBeXy8JVc"
 CAPTCHAAI_IN_URL = "https://ocr.captchaai.com/in.php"
 CAPTCHAAI_RES_URL = "https://ocr.captchaai.com/res.php"
 
-# Account Pool Constraints: Minimum 20 is compulsory, Maximum 20000
-MIN_POOL_SIZE = max(20, int(os.environ.get("MIN_POOL_SIZE", "20")))
-MAX_POOL_SIZE = min(20000, max(20, int(os.environ.get("MAX_POOL_SIZE", "20000"))))
-WORKER_THREADS = 10  # 10 concurrent threads for creation & batch checking
+# Account Pool Constraints: Minimum 500 is default, Maximum 5000
+MIN_POOL_SIZE = max(20, int(os.environ.get("MIN_POOL_SIZE", "500")))
+MAX_POOL_SIZE = min(5000, max(20, int(os.environ.get("MAX_POOL_SIZE", "5000"))))
+WORKER_THREADS = 5  # 5 concurrent threads for creation & batch checking
 
 # Realistic US addresses for WooCommerce registration billing address (81801 vault fix)
 US_ADDRESSES = [
@@ -915,7 +915,7 @@ if app:
                     "credit": CREDIT
                 })
 
-            # Minimum 20 is compulsory, Maximum 20000
+            # Minimum 20 is compulsory, Maximum 5000
             try:
                 raw_n = int(acc)
             except Exception:
@@ -923,8 +923,8 @@ if app:
 
             if raw_n < 20:
                 n = 20
-            elif raw_n > 20000:
-                n = 20000
+            elif raw_n > 5000:
+                n = 5000
             else:
                 n = raw_n
 
@@ -1017,5 +1017,5 @@ if __name__ == "__main__":
     auto_maintain_pool()
 
     print(f"BowlerX Braintree Auth gate ($0) | pool:{len(load_pool())} | port:{port}")
-    print(f"Build accounts: /b3?acc=20")
+    print(f"Build accounts: /b3?acc=500")
     uvicorn.run(app, host="0.0.0.0", port=port)
